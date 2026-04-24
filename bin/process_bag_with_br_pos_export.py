@@ -1,6 +1,6 @@
-import rosbag2_py
-from rclpy.serialization import deserialize_message
-from rosidl_runtime_py.utilities import get_message
+from rosbags.rosbag2 import Reader as Rosbag2Reader
+from rosbags.typesys import Stores, get_typestore
+from rosbags.typesys.msg import get_types_from_msg
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.animation as animation
@@ -123,7 +123,7 @@ def draw_walls(ax):
     ax.add_collection3d(poly)
 
 def analyze_ros2_bag(bag_path, namespace, t0=0, tf=float('inf'), export_angular_velocity=True):
-  yaml_file = '/home/neo/workspace/src/jirl_bringup/config/config.yaml'
+  yaml_file = '/project_code/racing/ese651_sim2real/src/jirl_bringup/config/config.yaml'
   with open(yaml_file, 'r') as f:
     data = yaml.safe_load(f)
   waypoints = np.array(data["/*/controller"]["ros__parameters"]["policy"]["waypoints"]).reshape(-1, 6)
@@ -177,125 +177,78 @@ def analyze_ros2_bag(bag_path, namespace, t0=0, tf=float('inf'), export_angular_
   print(f"Saving plots and animation to: {output_plot_dir}")
   # --- End Path setup ---
 
-  reader = rosbag2_py.SequentialReader()
-
-  # --- Improved Determine storage_id and uri based on bag_path ---
+  # --- Determine the path rosbags should open ---
+  # rosbags.rosbag2.Reader accepts:
+  #   - a directory containing metadata.yaml + .db3 or .mcap files
+  #   - a direct path to an .mcap file
   resolved_bag_path = Path(bag_path).resolve()
-  bag_uri = str(resolved_bag_path) # Default URI is the resolved input path
-  storage_id = None # Start with None, force explicit detection
 
   if not resolved_bag_path.exists():
-      # Path doesn't exist. Guess based on expected suffix or directory structure.
-      print(f"Warning: Bag path '{bag_path}' does not exist. Guessing storage format based on name.")
-      if bag_path.endswith('.mcap'):
-          storage_id = 'mcap'
-          bag_uri = bag_path # Use the original path string as URI
-      elif bag_path.endswith('.db3'):
-           storage_id = 'sqlite3'
-           bag_uri = bag_path # Use the original path string as URI
-      elif '.' not in Path(bag_path).name: # Assume it's intended as a directory for sqlite3
-          storage_id = 'sqlite3'
-          bag_uri = bag_path # Use the original path string as URI
-      else:
-          print(f"Error: Cannot determine storage type for non-existent path with unknown extension: {bag_path}")
-          sys.exit(1)
-
-  elif resolved_bag_path.is_dir():
-      print(f"Input path '{bag_path}' is a directory. Checking contents...")
-      mcap_files = list(resolved_bag_path.glob('*.mcap'))
-      db3_files = list(resolved_bag_path.glob('*.db3'))
-      metadata_file = resolved_bag_path / 'metadata.yaml'
-
-      if mcap_files:
-          if len(mcap_files) > 1:
-              print(f"Warning: Multiple MCAP files found in {resolved_bag_path}. Using the first one: {mcap_files[0].name}")
-          print(f"Found MCAP file: {mcap_files[0].name}. Setting storage_id='mcap' and URI to the file path.")
-          storage_id = 'mcap'
-          bag_uri = str(mcap_files[0].resolve()) # CRITICAL: URI must be the MCAP file itself, resolved
-      elif db3_files:
-          # If db3 files exist, the URI should be the directory itself.
-          print(f"Found db3 file(s): {[f.name for f in db3_files]}. Setting storage_id='sqlite3' and URI to the directory path.")
-          storage_id = 'sqlite3'
-          bag_uri = str(resolved_bag_path) # URI is the directory for sqlite3
-      elif metadata_file.exists():
-           # If only metadata exists, assume sqlite3 (common case for ongoing recordings or bags without db3 yet)
-           print(f"Found metadata.yaml, assuming 'sqlite3' storage with directory URI.")
-           storage_id = 'sqlite3'
-           bag_uri = str(resolved_bag_path)
-      else:
-           # No mcap, no db3, no metadata... ambiguous.
-           print(f"Error: Could not determine storage type for directory {resolved_bag_path}. No .mcap, .db3, or metadata.yaml found.")
-           sys.exit(1)
-
-  elif resolved_bag_path.is_file():
-      if resolved_bag_path.suffix == '.mcap':
-          print("Input path is an MCAP file. Setting storage_id='mcap'.")
-          storage_id = 'mcap'
-          bag_uri = str(resolved_bag_path) # URI is the file
-      elif resolved_bag_path.suffix == '.db3':
-          print("Input path is a DB3 file. Setting storage_id='sqlite3'.")
-          storage_id = 'sqlite3'
-          # For sqlite3, rosbag2_py generally expects the *directory* containing the db3.
-          # Using the file path directly *might* work in some versions, but using the parent dir is safer.
-          bag_uri = str(resolved_bag_path.parent)
-          print(f"Note: For .db3 file, using parent directory as URI: {bag_uri}")
-      else:
-          print(f"Error: Input path is a file with unrecognized suffix: {resolved_bag_path.suffix}")
-          sys.exit(1)
-
-  # Final check if detection failed somehow
-  if storage_id is None:
-      print("Error: Could not determine storage ID after checking path and contents.")
+      print(f"Error: Bag path '{bag_path}' does not exist.")
       sys.exit(1)
+  elif resolved_bag_path.is_file() and resolved_bag_path.suffix == '.db3':
+      # rosbags expects the *directory* for sqlite3 bags
+      reader_path = resolved_bag_path.parent
+      print(f"Input is a .db3 file; using parent directory as bag path: {reader_path}")
+  else:
+      # Directory (sqlite3 or mcap) or direct .mcap file — rosbags handles both
+      reader_path = resolved_bag_path
 
-  print(f"Using storage ID: '{storage_id}' for URI: '{bag_uri}'")
-  storage_options = rosbag2_py.StorageOptions(uri=bag_uri, storage_id=storage_id)
-  converter_options = rosbag2_py.ConverterOptions()
-  # --- End storage_id determination ---
+  print(f"Opening bag at: {reader_path}")
 
-  try:
-    reader.open(storage_options, converter_options)
-  except Exception as e:
-    print(f"Error opening bag file: {e}")
-    print("Please ensure the bag path and format are correct, and the bag is not corrupted.")
-    print(f"Attempted Path/URI: {bag_uri}")
-    print(f"Attempted Storage ID: {storage_id}")
-    # Print available storage plugins hint
-    try:
-        from rosbag2_py import get_registered_readers
-        print(f"Available storage readers: {get_registered_readers()}")
-    except Exception:
-        pass # Ignore if this fails
-    return # Exit function if bag cannot be opened
+  # --- Build typestore for deserialization ---
+  # Uses ROS2 Humble built-in types. For other distros swap Stores.ROS2_HUMBLE
+  # with e.g. Stores.ROS2_IRON or Stores.LATEST.
+  typestore = get_typestore(Stores.ROS2_HUMBLE)
 
-  topic_types = reader.get_all_topics_and_types()
-  type_map = {topic.name: topic.type for topic in topic_types}
+  # --- Register jirl_interfaces custom message types ---
+  # Definitions mirror the MSG files in src/jirl_interfaces/msg/.
+  # Update these if the message definitions change.
+  _JIRL_MSG_DEFS = {
+      'jirl_interfaces/msg/CommandCTBR': (
+          'string crazyflie_name\n'
+          'uint16 thrust_pwm\n'
+          'float64 thrust_n\n'
+          'float64 roll_rate\n'
+          'float64 pitch_rate\n'
+          'float64 yaw_rate\n'
+      ),
+      'jirl_interfaces/msg/Trajectory': (
+          'float64[3] x\n'
+          'float64[3] x_dot\n'
+          'float64[3] x_ddot\n'
+          'float64[3] x_dddot\n'
+          'float64[3] x_ddddot\n'
+          'float64 yaw\n'
+          'float64 yaw_dot\n'
+          'float64 yaw_ddot\n'
+      ),
+      'jirl_interfaces/msg/Observations': (
+          'float64[3] lin_vel\n'
+          'float64[9] rot\n'
+          'float64[12] corners_pos_b_curr\n'
+          'float64[12] corners_pos_b_next\n'
+          'float64[2] cond\n'
+      ),
+      'jirl_interfaces/msg/OdometryArray': (
+          'nav_msgs/msg/Odometry[] odom_array\n'
+      ),
+  }
 
-  print("\nAvailable topics:")
-  for topic, msg_type in type_map.items():
-    print(f"- {topic}: {msg_type}")
+  _all_custom_types = {}
+  for _msgtype, _msgdef in _JIRL_MSG_DEFS.items():
+      try:
+          _all_custom_types.update(get_types_from_msg(_msgdef, _msgtype))
+      except Exception as _e:
+          print(f"Warning: Could not parse definition for {_msgtype}: {_e}")
+  if _all_custom_types:
+      try:
+          typestore.register(_all_custom_types)
+          print(f"Registered {len(_all_custom_types)} custom jirl_interfaces type(s).")
+      except Exception as _e:
+          print(f"Warning: Could not register custom types: {_e}")
 
-  # Check if required topics exist
-  required_topics = [f"/{namespace}/observations", f"/{namespace}/odom", f"/{namespace}/ctbr_cmd", f"/{namespace}/trajectory", "/ctbr_cmd"]
-  missing_topics = []
-  # Check topics with and without leading slash for robustness
-  for req_topic in required_topics:
-      base_topic = req_topic.lstrip('/')
-      if req_topic not in type_map and f"/{base_topic}" not in type_map:
-          # Check if maybe the namespace itself has a leading slash issue
-           if req_topic.startswith(f"/{namespace}/") and f"{namespace}/{req_topic.split(f'/{namespace}/', 1)[1]}" not in type_map:
-               missing_topics.append(req_topic)
-           elif not req_topic.startswith(f"/{namespace}/"): # Global topics like /ctbr_cmd
-                 if req_topic not in type_map and req_topic.lstrip('/') not in type_map:
-                      missing_topics.append(req_topic)
-
-
-  if missing_topics:
-      print("\nWarning: The following required topics (or variants) were not found in the bag:")
-      for t in missing_topics:
-          print(f"- {t}")
-      # Decide whether to continue or exit - let's continue for now
-
+  # --- Data containers ---
   timestamps = []
   timestamps_cmd = []
   timestamps_traj = []
@@ -317,166 +270,168 @@ def analyze_ros2_bag(bag_path, namespace, t0=0, tf=float('inf'), export_angular_
 
   first_timestamp = None
 
-  print("\nReading bag data...")
-  message_count = 0
-  processed_count = 0
-  while reader.has_next():
-    try:
-        (topic, data, timestamp_ns) = reader.read_next()
-        message_count += 1
-        timestamp_sec = timestamp_ns * 1e-9 # nanoseconds to seconds
+  # Topic name patterns we care about (normalized, no leading slash)
+  odom_topic  = f"{namespace}/odom"
+  cmd_topic   = f"/ctbr_cmd"
+  traj_topic  = f"{namespace}/trajectory"
+  obs_topic   = f"{namespace}/observations"
+  global_cmd_topic = "ctbr_cmd"
 
-        if first_timestamp is None:
-          first_timestamp = timestamp_sec
+  try:
+    with Rosbag2Reader(str(reader_path)) as reader:
 
-        rel_time = timestamp_sec - first_timestamp
-        if rel_time < t0 or rel_time > tf:
-          continue # Skip message if outside time range
+      # --- Build topic→msgtype map from connections ---
+      type_map = {conn.topic: conn.msgtype for conn in reader.connections}
 
-        processed_count += 1
-        # Normalize topic name (remove leading slash if present for comparison)
-        normalized_topic = topic.lstrip('/')
+      print("\nAvailable topics:")
+      for topic, msg_type in type_map.items():
+        print(f"- {topic}: {msg_type}")
 
-        if topic not in type_map:
-            # This might happen with late-discovered topics?
-            # Try to get type dynamically if possible, otherwise skip
-            print(f"Warning: Skipping message from topic '{topic}' not initially listed in type map.")
+      # Warn about missing required topics
+      required_topics = [
+          f"/{namespace}/observations", f"/{namespace}/odom",
+          f"/ctbr_cmd",    f"/{namespace}/trajectory",
+        #   "/ctbr_cmd",
+      ]
+      missing_topics = []
+      for req_topic in required_topics:
+          base = req_topic.lstrip('/')
+          if req_topic not in type_map and f"/{base}" not in type_map and base not in type_map:
+              missing_topics.append(req_topic)
+      if missing_topics:
+          print("\nWarning: The following required topics were not found in the bag:")
+          for t in missing_topics:
+              print(f"- {t}")
+
+      # --- Identify any types still not in the typestore after pre-registration ---
+      unknown_types: set = set()
+      for conn in reader.connections:
+          if conn.msgtype not in typestore.fielddefs:
+              unknown_types.add(conn.msgtype)
+
+      if unknown_types:
+          print(
+              "\nNote: The following message types are not in the typestore and will be "
+              "skipped if deserialization fails:\n"
+              + "\n".join(f"  - {t}" for t in unknown_types)
+              + "\nAdd their MSG definitions to _JIRL_MSG_DEFS at the top of this script "
+              "to support them."
+          )
+
+      # --- Select only connections for topics we actually use ---
+      wanted = {odom_topic, cmd_topic, traj_topic, obs_topic, global_cmd_topic}
+      relevant_connections = [
+          conn for conn in reader.connections
+          if conn.topic.lstrip('/') in wanted
+      ]
+
+      print("\nReading bag data...")
+      message_count = 0
+      processed_count = 0
+
+      for connection, timestamp_ns, rawdata in reader.messages(connections=relevant_connections):
+        try:
+          message_count += 1
+          timestamp_sec = timestamp_ns * 1e-9  # nanoseconds → seconds
+
+          if first_timestamp is None:
+            first_timestamp = timestamp_sec
+
+          rel_time = timestamp_sec - first_timestamp
+          if rel_time < t0 or rel_time > tf:
+            continue  # outside requested time window
+
+          # --- Deserialize ---
+          try:
+            message = typestore.deserialize_cdr(rawdata, connection.msgtype)
+          except Exception as deser_err:
+            if connection.msgtype not in unknown_types:
+              print(f"Warning: Could not deserialize '{connection.msgtype}' "
+                    f"on topic '{connection.topic}': {deser_err}")
+              unknown_types.add(connection.msgtype)
             continue
 
-        msg_type = type_map[topic]
-        try:
-            msg_class = get_message(msg_type)
-            message = deserialize_message(data, msg_class)
-        except Exception as e:
-            print(f"Error deserializing message for topic {topic} ({msg_type}): {e}")
-            continue # Skip this message
+          processed_count += 1
+          normalized_topic = connection.topic.lstrip('/')
 
-        # --- Topic processing ---
-        odom_topic = f"{namespace}/odom".lstrip('/')
-        cmd_topic = f"/{namespace}/ctbr_cmd".lstrip('/')
-        traj_topic = f"{namespace}/trajectory".lstrip('/')
-        obs_topic = f"/{namespace}/observations".lstrip('/')
+          # --- Topic processing ---
+          if normalized_topic == odom_topic:
+            timestamps.append(rel_time)
+            gt_pos["x"].append(message.pose.pose.position.x)
+            gt_pos["y"].append(message.pose.pose.position.y)
+            gt_pos["z"].append(message.pose.pose.position.z)
+            gt_quat["x"].append(message.pose.pose.orientation.x)
+            gt_quat["y"].append(message.pose.pose.orientation.y)
+            gt_quat["z"].append(message.pose.pose.orientation.z)
+            gt_quat["w"].append(message.pose.pose.orientation.w)
 
-        if normalized_topic == odom_topic:
-          timestamps.append(rel_time)
-          gt_pos["x"].append(message.pose.pose.position.x)
-          gt_pos["y"].append(message.pose.pose.position.y)
-          gt_pos["z"].append(message.pose.pose.position.z)
-          gt_quat["x"].append(message.pose.pose.orientation.x)
-          gt_quat["y"].append(message.pose.pose.orientation.y)
-          gt_quat["z"].append(message.pose.pose.orientation.z)
-          gt_quat["w"].append(message.pose.pose.orientation.w)
+            quat = [
+              message.pose.pose.orientation.x,
+              message.pose.pose.orientation.y,
+              message.pose.pose.orientation.z,
+              message.pose.pose.orientation.w
+            ]
+            rot = R.from_quat(quat)
+            rot_T = rot.as_matrix().T
 
-          quat = [
-            message.pose.pose.orientation.x,
-            message.pose.pose.orientation.y,
-            message.pose.pose.orientation.z,
-            message.pose.pose.orientation.w
-          ]
-          rot = R.from_quat(quat)
-          rot_T = rot.as_matrix().T
+            lin_vel_world = np.array([
+              message.twist.twist.linear.x,
+              message.twist.twist.linear.y,
+              message.twist.twist.linear.z
+            ])
+            ang_vel_world = np.array([
+              message.twist.twist.angular.x,
+              message.twist.twist.angular.y,
+              message.twist.twist.angular.z
+            ])
 
-          lin_vel_world = np.array([
-            message.twist.twist.linear.x,
-            message.twist.twist.linear.y,
-            message.twist.twist.linear.z
-          ])
-          ang_vel_world = np.array([
-            message.twist.twist.angular.x,
-            message.twist.twist.angular.y,
-            message.twist.twist.angular.z
-          ])
+            lin_vel_body = rot_T @ lin_vel_world
+            ang_vel_body = rot_T @ ang_vel_world * 180.0 / np.pi
 
-          lin_vel_body = rot_T @ lin_vel_world
-          ang_vel_body = rot_T @ ang_vel_world * 180.0 / np.pi
+            gt_lin_vel["x"].append(lin_vel_body[0])
+            gt_lin_vel["y"].append(lin_vel_body[1])
+            gt_lin_vel["z"].append(lin_vel_body[2])
+            gt_ang_vel["x"].append(ang_vel_body[0])
+            gt_ang_vel["y"].append(ang_vel_body[1])
+            gt_ang_vel["z"].append(ang_vel_body[2])
 
-          gt_lin_vel["x"].append(lin_vel_body[0])
-          gt_lin_vel["y"].append(lin_vel_body[1])
-          gt_lin_vel["z"].append(lin_vel_body[2])
-          gt_ang_vel["x"].append(ang_vel_body[0])
-          gt_ang_vel["y"].append(ang_vel_body[1])
-          gt_ang_vel["z"].append(ang_vel_body[2])
+          elif normalized_topic in (cmd_topic, global_cmd_topic):
+            cf_name_in_msg = getattr(message, 'crazyflie_name', None)
+            if cf_name_in_msg is not None and namespace not in cf_name_in_msg:
+              continue  # belongs to a different drone
+            timestamps_cmd.append(rel_time)
+            thrust_pwm.append(getattr(message, 'thrust_pwm', float('nan')))
+            thrust_N.append(getattr(message, 'thrust_n', float('nan')))
+            roll_rate.append(getattr(message, 'roll_rate', float('nan')))
+            pitch_rate.append(getattr(message, 'pitch_rate', float('nan')))
+            yaw_rate.append(getattr(message, 'yaw_rate', float('nan')))
 
+          elif normalized_topic == traj_topic:
+            timestamps_traj.append(rel_time)
+            traj["x"].append(getattr(message, 'x', [float('nan')] * 3))
+            traj["x_dot"].append(getattr(message, 'x_dot', [float('nan')] * 3))
+            traj["x_ddot"].append(getattr(message, 'x_ddot', [float('nan')] * 3))
+            traj["x_dddot"].append(getattr(message, 'x_dddot', [float('nan')] * 3))
+            traj["x_ddddot"].append(getattr(message, 'x_ddddot', [float('nan')] * 3))
+            traj["yaw"].append(getattr(message, 'yaw', float('nan')))
+            traj["yaw_dot"].append(getattr(message, 'yaw_dot', float('nan')))
+            traj["yaw_ddot"].append(getattr(message, 'yaw_ddot', float('nan')))
 
-
-
-        elif normalized_topic == cmd_topic:
-           # Check if message has crazyflie_name (assuming specific message type)
-           # Make the check more robust in case the attribute doesn't exist
-           cf_name_in_msg = getattr(message, 'crazyflie_name', None) # Returns None if not present
-           # Check if the attribute exists AND if the namespace is in the list/string
-           if cf_name_in_msg is not None and namespace in cf_name_in_msg:
-                timestamps_cmd.append(rel_time)
-                # Check for attributes before accessing to prevent errors on malformed msgs
-                thrust_pwm.append(getattr(message, 'thrust_pwm', float('nan')))
-                thrust_N.append(getattr(message, 'thrust_n', float('nan')))
-                roll_rate.append(getattr(message, 'roll_rate', float('nan')))
-                pitch_rate.append(getattr(message, 'pitch_rate', float('nan')))
-                yaw_rate.append(getattr(message, 'yaw_rate', float('nan')))
-           # If the attribute doesn't exist, maybe it's a generic command? Or log warning.
-           elif cf_name_in_msg is None:
-                # Decide: skip, process anyway, or warn? Let's warn and process.
-                # print(f"Warning: /ctbr_cmd message at {rel_time:.2f}s lacks 'crazyflie_name'. Assuming it applies to {namespace}.")
-                timestamps_cmd.append(rel_time)
-                thrust_pwm.append(getattr(message, 'thrust_pwm', float('nan')))
-                thrust_N.append(getattr(message, 'thrust_n', float('nan')))
-                roll_rate.append(getattr(message, 'roll_rate', float('nan')))
-                pitch_rate.append(getattr(message, 'pitch_rate', float('nan')))
-                yaw_rate.append(getattr(message, 'yaw_rate', float('nan')))
-
-        elif normalized_topic == traj_topic:
-          timestamps_traj.append(rel_time)
-          # Check for attributes before accessing
-          traj["x"].append(getattr(message, 'x', [float('nan')]*3)) # Default to NaN array if missing
-          traj["x_dot"].append(getattr(message, 'x_dot', [float('nan')]*3))
-          traj["x_ddot"].append(getattr(message, 'x_ddot', [float('nan')]*3))
-          traj["x_dddot"].append(getattr(message, 'x_dddot', [float('nan')]*3))
-          traj["x_ddddot"].append(getattr(message, 'x_ddddot', [float('nan')]*3))
-          traj["yaw"].append(getattr(message, 'yaw', float('nan')))
-          traj["yaw_dot"].append(getattr(message, 'yaw_dot', float('nan')))
-          traj["yaw_ddot"].append(getattr(message, 'yaw_ddot', float('nan')))
-
-        elif normalized_topic == 'ctbr_cmd':
-            # Check if message has crazyflie_name (assuming specific message type)
-            # Make the check more robust in case the attribute doesn't exist
-            cf_name_in_msg = getattr(message, 'crazyflie_name', None) # Returns None if not present
-            # Check if the attribute exists AND if the namespace is in the list/string
-            if cf_name_in_msg is not None and namespace in cf_name_in_msg:
-                timestamps_cmd.append(rel_time)
-                # Check for attributes before accessing to prevent errors on malformed msgs
-                thrust_pwm.append(getattr(message, 'thrust_pwm', float('nan')))
-                thrust_N.append(getattr(message, 'thrust_n', float('nan')))
-                roll_rate.append(getattr(message, 'roll_rate', float('nan')))
-                pitch_rate.append(getattr(message, 'pitch_rate', float('nan')))
-                yaw_rate.append(getattr(message, 'yaw_rate', float('nan')))
-            # If the attribute doesn't exist, maybe it's a generic command? Or log warning.
-            elif cf_name_in_msg is None:
-                # Decide: skip, process anyway, or warn? Let's warn and process.
-                # print(f"Warning: /ctbr_cmd message at {rel_time:.2f}s lacks 'crazyflie_name'. Assuming it applies to {namespace}.")
-                timestamps_cmd.append(rel_time)
-                thrust_pwm.append(getattr(message, 'thrust_pwm', float('nan')))
-                thrust_N.append(getattr(message, 'thrust_n', float('nan')))
-                roll_rate.append(getattr(message, 'roll_rate', float('nan')))
-                pitch_rate.append(getattr(message, 'pitch_rate', float('nan')))
-                yaw_rate.append(getattr(message, 'yaw_rate', float('nan')))
-
-        elif normalized_topic == obs_topic:
+          elif normalized_topic == obs_topic:
             timestamps_obs.append(rel_time)
-            corners = getattr(message, 'corners_pos_b_curr', float('nan')).reshape(4,3)
+            corners = np.asarray(getattr(message, 'corners_pos_b_curr', np.full(12, float('nan')))).reshape(4, 3)
             mean_point = corners.mean(axis=0)
             dist_next_gate.append(np.linalg.norm(mean_point))
             pose_wrt_gate_body.append(mean_point.copy())
 
-    except StopIteration: # This is expected when the reader finishes
-        break
-    except Exception as e:
-        # Catch other potential errors during reading/processing loop
-        print(f"\nAn error occurred while reading or processing message #{message_count}: {e}")
-        print("Topic:", topic)
-        print("Timestamp (ns):", timestamp_ns)
-        # Decide whether to stop or continue (continuing might lead to incomplete data)
-        # break
-        continue # Try processing next message
+        except Exception as e:
+          print(f"\nError processing message #{message_count} on '{connection.topic}': {e}")
+          continue
+
+  except Exception as e:
+    print(f"Error opening bag file '{reader_path}': {e}")
+    print("Ensure the path is correct and the bag is not corrupted.")
+    return
 
   print(f"Finished reading bag data. Read {message_count} messages total, processed {processed_count} within time range [{t0}, {tf}].")
 

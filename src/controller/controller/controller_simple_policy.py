@@ -32,7 +32,7 @@ class SimpleRacingPolicy:
     def __init__(self, vehicle, model_path, params, device="cpu"):
         self.quadrotor = vehicle
         self.device = torch.device(device)
-        self.obs_dim = 3 + 9 + 12 + 12
+        self.obs_dim = 41
 
         self.action_dim = 4
 
@@ -71,8 +71,9 @@ class SimpleRacingPolicy:
         self.max_roll_br = params["max_roll_br"]
         self.max_pitch_br = params["max_pitch_br"]
         self.max_yaw_br = params["max_yaw_br"]
-        # Default value if not in params
-        self.pass_gate_thr = params.get("pass_gate_thr", 0.10)
+        self.pass_gate_thr = params.get("pass_gate_thr", 0.10)  # Default value if not in params
+
+        self.last_action = torch.zeros(4, device=self.device)
 
     def update(self, state):
         """
@@ -86,6 +87,10 @@ class SimpleRacingPolicy:
         pos_drone = state['x']
         lin_vel_drone = state['v_b']
         rot_drone = state['R']
+        quat_drone = np.array(state['q'])
+        # remap quat to wxyz to match isaaclab convention - controller_utils.py seems to have this in xyzw
+        quat_drone = quat_drone[..., [3, 0, 1, 2]]
+        ang_vel_drone = state['w_b']
 
         curr_idx = self.idx_wp
         next_idx = (self.idx_wp + 1) % self.waypoints.shape[0]
@@ -110,22 +115,28 @@ class SimpleRacingPolicy:
         verts_curr = self.local_square @ rot_curr.T + wp_curr_pos
         verts_next = self.local_square @ rot_next.T + wp_next_pos
 
+        center_pos_b_curr = self._subtract_frame_transforms(pos_drone, rot_drone, wp_curr_pos)
         waypoint_pos_b_curr = self._subtract_frame_transforms(
             pos_drone, rot_drone, verts_curr).reshape(4, 3)
         waypoint_pos_b_next = self._subtract_frame_transforms(
             pos_drone, rot_drone, verts_next).reshape(4, 3)
 
         obs = [
+            torch.from_numpy(center_pos_b_curr).float().flatten(),
             torch.from_numpy(lin_vel_drone).float().flatten(),
-            torch.from_numpy(rot_drone).float().flatten(),
+            torch.from_numpy(quat_drone).float().flatten(),
+            torch.from_numpy(ang_vel_drone).float().flatten(),
             torch.from_numpy(waypoint_pos_b_curr).float().flatten(),
             torch.from_numpy(waypoint_pos_b_next).float().flatten(),
+            self.last_action,
         ]
 
         obs = torch.cat(obs).float().to(self.device)
 
         with torch.no_grad():
-            actions = self.model(obs).squeeze(0).cpu().numpy()
+            actions = self.model(obs)
+            self.last_action = actions.clone()
+            actions = actions.squeeze(0).cpu().numpy()
         actions = np.clip(actions, -1, 1)
 
         cmd_thrust = 0.5 * (actions[0] + 1.0)
